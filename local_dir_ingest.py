@@ -8,7 +8,7 @@ single TXT file.
 
 Default behavior:
 - local directory only
-- include files up to 50 KB
+- include code/doc files up to 50 KB: .py, .sh, .txt, .md
 - skip obvious binary / cache / build directories
 - keep the output format easy for LLMs to read
 
@@ -19,6 +19,7 @@ python local_dir_ingest.py /root/dev/Threedv/Freedance_ours -o freedance_digest.
 python local_dir_ingest.py /root/dev/Threedv/Freedance_ours --max-file-kb 200
 python local_dir_ingest.py /root/dev/Threedv/Freedance_ours -i "*.py" -i "*.md"
 python local_dir_ingest.py /root/dev/Threedv/Freedance_ours -e "data/*" -e "*.pt"
+python local_dir_ingest.py /root/dev/Threedv/Freedance_ours --all-text
 python local_dir_ingest.py /root/dev/Threedv/Freedance_ours -o -
 """
 
@@ -30,15 +31,31 @@ import fnmatch
 import json
 import locale
 import os
+import ssl
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
+try:
+    import requests.exceptions as requests_exceptions
+except ImportError:  # pragma: no cover - installed transitively with tiktoken
+    requests_exceptions = None
+
+try:
+    import tiktoken
+except ImportError:  # pragma: no cover - optional dependency guard for CLI use
+    tiktoken = None
+
 DEFAULT_MAX_FILE_KB = 50
 DEFAULT_OUTPUT_FILE = "digest.txt"
 SEPARATOR = "=" * 48
 _SAMPLE_SIZE = 4096
+DEFAULT_INCLUDE_PATTERNS = ["*.py", "*.sh", "*.txt", "*.md"]
+_TOKEN_THRESHOLDS = [
+    (1_000_000, "M"),
+    (1_000, "k"),
+]
 
 # Directories that are almost always noise for LLM ingestion.
 DEFAULT_IGNORED_DIRS = {
@@ -47,6 +64,8 @@ DEFAULT_IGNORED_DIRS = {
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
+    ".ipynb_checkpoints",
+    ".ddp_cache",
     ".tox",
     ".nox",
     ".venv",
@@ -56,6 +75,12 @@ DEFAULT_IGNORED_DIRS = {
     "dist",
     "build",
     "target",
+    "checkpoints",
+    "logs",
+    "outputs",
+    "results",
+    "runs",
+    "wandb",
     ".idea",
     ".vscode",
 }
@@ -100,7 +125,7 @@ DEFAULT_IGNORED_FILE_PATTERNS = {
 }
 
 
-@dataclass(slots=True)
+@dataclass
 class CollectedFile:
     """A text file that will be included in the digest."""
 
@@ -109,7 +134,7 @@ class CollectedFile:
     content: str
 
 
-@dataclass(slots=True)
+@dataclass
 class Stats:
     """Counters collected during directory traversal."""
 
@@ -122,7 +147,7 @@ class Stats:
     skipped_unreadable: int = 0
 
 
-@dataclass(slots=True)
+@dataclass
 class TreeNode:
     """Simple tree structure for rendering included files."""
 
@@ -174,7 +199,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--include",
         action="append",
         default=[],
-        help="Glob pattern(s) to include. Repeatable. Example: -i '*.py' -i '*.md'",
+        help=(
+            "Glob pattern(s) to include. Repeatable. "
+            "Default when omitted: *.py, *.sh, *.txt, *.md"
+        ),
     )
     parser.add_argument(
         "-e",
@@ -192,6 +220,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--include-notebook-output",
         action="store_true",
         help="When reading .ipynb, include cell outputs as comments.",
+    )
+    parser.add_argument(
+        "--all-text",
+        action="store_true",
+        help="Include every detected text file instead of the default code/doc patterns.",
     )
     return parser.parse_args(argv)
 
@@ -212,6 +245,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     include_patterns = normalize_patterns(args.include)
+    if not include_patterns and not args.all_text:
+        include_patterns = list(DEFAULT_INCLUDE_PATTERNS)
     exclude_patterns = normalize_patterns(args.exclude)
     output_path = None if args.output == "-" else Path(args.output).expanduser().resolve()
 
@@ -554,6 +589,9 @@ def build_digest_text(
 ) -> str:
     """Create the final digest text."""
     tree = build_tree_text(source, files)
+    content_text = build_content_text(files)
+    counted_text = "Directory structure:\n" + tree.rstrip() + "\n\n" + content_text
+    token_estimate = format_token_count(counted_text)
 
     lines = [
         f"Directory: {source}",
@@ -567,6 +605,9 @@ def build_digest_text(
         f"Skipped as unreadable: {stats.skipped_unreadable}",
     ]
 
+    if token_estimate:
+        lines.append(f"Estimated tokens: {token_estimate}")
+
     if include_patterns:
         lines.append("Include patterns: " + ", ".join(include_patterns))
     if exclude_patterns:
@@ -576,6 +617,14 @@ def build_digest_text(
     lines.append("Directory structure:")
     lines.append(tree.rstrip())
     lines.append("")
+    lines.append(content_text.rstrip("\n"))
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def build_content_text(files: Sequence[CollectedFile]) -> str:
+    """Create the file-content section of the digest."""
+    lines: list[str] = []
 
     for item in files:
         lines.append(SEPARATOR)
@@ -592,6 +641,28 @@ def build_digest_text(
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def format_token_count(text: str) -> str | None:
+    """Estimate token count using the same tokenizer family as gitingest."""
+    if tiktoken is None:
+        return None
+
+    try:
+        encoding = tiktoken.get_encoding("o200k_base")
+        total_tokens = len(encoding.encode(text, disallowed_special=()))
+    except (ValueError, UnicodeEncodeError, OSError, ssl.SSLError):
+        return None
+    except Exception as exc:
+        if requests_exceptions is not None and isinstance(exc, requests_exceptions.RequestException):
+            return None
+        raise
+
+    for threshold, suffix in _TOKEN_THRESHOLDS:
+        if total_tokens >= threshold:
+            return f"{total_tokens / threshold:.1f}{suffix}"
+
+    return str(total_tokens)
 
 
 def build_tree_text(source: Path, files: Sequence[CollectedFile]) -> str:

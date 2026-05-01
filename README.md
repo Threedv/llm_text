@@ -16,12 +16,19 @@ Useful when:
 - includes files up to a configurable size limit
 - supports include / exclude glob filters
 - can convert `.ipynb` notebooks into readable text
+- estimates tokens with `tiktoken` using the `o200k_base` encoding
 - writes to a file or stdout
 
 ## Requirements
 
-- Python 3.10+ recommended
-- no external dependencies
+- Python 3.9+
+- `tiktoken>=0.7.0`
+
+Install dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+```
 
 ## Quick start
 
@@ -90,6 +97,7 @@ Example:
 Directory: /path/to/project
 Files analyzed: 12
 Included bytes: 41,203 (40.2 KB)
+Estimated tokens: 12.3k
 ...
 
 Directory structure:
@@ -108,8 +116,10 @@ FILE: README.md
 ## Notes
 
 - default max file size is `50 KB`
+- default include patterns are `*.py`, `*.sh`, `*.txt`, and `*.md`
 - binary / media / archive files are skipped
 - common directories like `.git`, `node_modules`, `dist`, `build`, and virtual envs are skipped
+- token estimates use the same `o200k_base` tokenizer approach as gitingest
 - if no files match, the tool still writes a valid digest with a message
 
 ## Example
