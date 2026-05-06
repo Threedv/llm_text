@@ -4,6 +4,12 @@ Small Python utility to turn a local directory into one LLM-friendly text digest
 
 It walks a directory, prints the included file tree, and appends the content of each included text file into a single output text file.
 
+## Install
+
+```bash
+python -m pip install -r requirements.txt
+```
+
 Useful when:
 - a repo is private
 - you want to share project context with an LLM without pushing the repo
@@ -12,23 +18,20 @@ Useful when:
 ## What it does
 
 - scans a local directory only
+- applies the source directory's `.gitignore` by default
 - skips common cache / build / binary files
-- includes files up to a configurable size limit
+- includes code, config, and doc files up to a configurable size limit
 - supports include / exclude glob filters
 - can convert `.ipynb` notebooks into readable text
 - estimates tokens with `tiktoken` using the `o200k_base` encoding
+- can print lightweight scan progress
 - writes to a file or stdout
 
 ## Requirements
 
 - Python 3.9+
+- `pathspec>=0.12.1`
 - `tiktoken>=0.7.0`
-
-Install dependencies:
-
-```bash
-python -m pip install -r requirements.txt
-```
 
 ## Quick start
 
@@ -50,6 +53,12 @@ python local_dir_ingest.py /path/to/project -o project_digest.txt
 
 ```bash
 python local_dir_ingest.py /path/to/project -o -
+```
+
+### Show scan progress
+
+```bash
+python local_dir_ingest.py /path/to/project --progress
 ```
 
 ### Increase max file size
@@ -82,6 +91,12 @@ python local_dir_ingest.py /path/to/project --include-notebook-output
 python local_dir_ingest.py /path/to/project --follow-symlinks
 ```
 
+### Ignore `.gitignore`
+
+```bash
+python local_dir_ingest.py /path/to/project --no-gitignore
+```
+
 ## Output format
 
 The generated digest contains:
@@ -95,6 +110,8 @@ Example:
 
 ```txt
 Directory: /path/to/project
+Scanned directories: 24
+Scanned files: 312
 Files analyzed: 12
 Included bytes: 41,203 (40.2 KB)
 Estimated tokens: 12.3k
@@ -116,7 +133,8 @@ FILE: README.md
 ## Notes
 
 - default max file size is `50 KB`
-- default include patterns are `*.py`, `*.sh`, `*.txt`, and `*.md`
+- default include patterns cover common code, config, and docs such as `*.py`, `*.sh`, `*.md`, `*.txt`, `*.yaml`, `*.json`, and `*.toml`
+- the source directory's `.gitignore` is applied by default
 - binary / media / archive files are skipped
 - common directories like `.git`, `node_modules`, `dist`, `build`, and virtual envs are skipped
 - token estimates use the same `o200k_base` tokenizer approach as gitingest

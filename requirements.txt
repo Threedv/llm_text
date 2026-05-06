@@ -1,1 +1,2 @@
+pathspec>=0.12.1
 tiktoken>=0.7.0

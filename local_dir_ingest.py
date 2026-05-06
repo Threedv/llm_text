@@ -8,7 +8,8 @@ single TXT file.
 
 Default behavior:
 - local directory only
-- include code/doc files up to 50 KB: .py, .sh, .txt, .md
+- apply the source directory's .gitignore
+- include code/config/doc files up to 50 KB
 - skip obvious binary / cache / build directories
 - keep the output format easy for LLMs to read
 
@@ -33,9 +34,15 @@ import locale
 import os
 import ssl
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
+
+try:
+    import pathspec
+except ImportError:  # pragma: no cover - dependency guard for CLI use
+    pathspec = None
 
 try:
     import requests.exceptions as requests_exceptions
@@ -51,7 +58,26 @@ DEFAULT_MAX_FILE_KB = 50
 DEFAULT_OUTPUT_FILE = "digest.txt"
 SEPARATOR = "=" * 48
 _SAMPLE_SIZE = 4096
-DEFAULT_INCLUDE_PATTERNS = ["*.py", "*.sh", "*.txt", "*.md"]
+DEFAULT_INCLUDE_PATTERNS = [
+    "*.py",
+    "*.sh",
+    "*.md",
+    "*.txt",
+    "*.yaml",
+    "*.yml",
+    "*.json",
+    "*.toml",
+    "*.ini",
+    "*.cfg",
+    "*.conf",
+    "Dockerfile",
+    "Makefile",
+    "requirements*.txt",
+    "setup.py",
+    "setup.cfg",
+    "pyproject.toml",
+    ".gitignore",
+]
 _TOKEN_THRESHOLDS = [
     (1_000_000, "M"),
     (1_000, "k"),
@@ -138,9 +164,12 @@ class CollectedFile:
 class Stats:
     """Counters collected during directory traversal."""
 
+    scanned_directories: int = 0
+    scanned_files: int = 0
     included_files: int = 0
     included_bytes: int = 0
     pruned_directories: int = 0
+    skipped_gitignore: int = 0
     skipped_pattern: int = 0
     skipped_too_large: int = 0
     skipped_binary: int = 0
@@ -173,6 +202,48 @@ class TreeNode:
             node.children[leaf_name] = TreeNode(name=leaf_name, is_dir=False)
 
 
+@dataclass
+class ProgressReporter:
+    """Lightweight progress output without a pre-scan."""
+
+    enabled: bool
+    interval_seconds: float = 0.25
+    last_rendered: float = field(default_factory=time.monotonic)
+
+    def render(self, stats: Stats, current_path: str, *, force: bool = False) -> None:
+        """Render current traversal counters to stderr."""
+        if not self.enabled:
+            return
+
+        now = time.monotonic()
+        if not force and now - self.last_rendered < self.interval_seconds:
+            return
+
+        self.last_rendered = now
+        display_path = current_path or "."
+        if len(display_path) > 80:
+            display_path = "..." + display_path[-77:]
+
+        message = (
+            f"dirs={stats.scanned_directories:,} "
+            f"files={stats.scanned_files:,} "
+            f"included={stats.included_files:,} "
+            f"gitignored={stats.skipped_gitignore:,} "
+            f"pruned_dirs={stats.pruned_directories:,} "
+            f"current={display_path}"
+        )
+        sys.stderr.write("\r" + message)
+        sys.stderr.flush()
+
+    def finish(self, stats: Stats) -> None:
+        """Finish the progress line cleanly."""
+        if not self.enabled:
+            return
+        self.render(stats, "done", force=True)
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
@@ -201,7 +272,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=[],
         help=(
             "Glob pattern(s) to include. Repeatable. "
-            "Default when omitted: *.py, *.sh, *.txt, *.md"
+            "Default when omitted: common code, config, and doc files."
         ),
     )
     parser.add_argument(
@@ -226,6 +297,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Include every detected text file instead of the default code/doc patterns.",
     )
+    parser.add_argument(
+        "--no-gitignore",
+        action="store_true",
+        help="Do not apply patterns from the source directory's .gitignore file.",
+    )
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Print lightweight scan progress to stderr. This does not pre-count files.",
+    )
     return parser.parse_args(argv)
 
 
@@ -248,17 +329,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not include_patterns and not args.all_text:
         include_patterns = list(DEFAULT_INCLUDE_PATTERNS)
     exclude_patterns = normalize_patterns(args.exclude)
+    gitignore_spec = None if args.no_gitignore else load_gitignore_spec(source)
     output_path = None if args.output == "-" else Path(args.output).expanduser().resolve()
+    progress = ProgressReporter(enabled=args.progress)
 
     files, stats = collect_files(
         source=source,
         max_file_bytes=args.max_file_kb * 1024,
         include_patterns=include_patterns,
         exclude_patterns=exclude_patterns,
+        gitignore_spec=gitignore_spec,
         follow_symlinks=args.follow_symlinks,
         include_notebook_output=args.include_notebook_output,
         output_path=output_path,
+        progress=progress,
     )
+    progress.finish(stats)
 
     digest_text = build_digest_text(
         source=source,
@@ -283,6 +369,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def load_gitignore_spec(source: Path) -> Any | None:
+    """Load source/.gitignore as a gitwildmatch PathSpec."""
+    gitignore_path = source / ".gitignore"
+    if not gitignore_path.is_file():
+        return None
+
+    if pathspec is None:
+        print(
+            "Warning: .gitignore exists but pathspec is not installed; ignoring .gitignore patterns.",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        lines = gitignore_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+
+    return pathspec.PathSpec.from_lines("gitwildmatch", lines)
+
+
 def normalize_patterns(values: Iterable[str]) -> list[str]:
     """Normalize repeated / comma-separated glob patterns."""
     patterns: list[str] = []
@@ -299,9 +406,11 @@ def collect_files(
     max_file_bytes: int,
     include_patterns: Sequence[str],
     exclude_patterns: Sequence[str],
+    gitignore_spec: Any | None,
     follow_symlinks: bool,
     include_notebook_output: bool,
     output_path: Path | None,
+    progress: ProgressReporter,
 ) -> tuple[list[CollectedFile], Stats]:
     """Walk the directory and collect readable text files."""
     stats = Stats()
@@ -310,6 +419,8 @@ def collect_files(
     for root, dirnames, filenames in os.walk(source, topdown=True, followlinks=follow_symlinks):
         root_path = Path(root)
         rel_root = "" if root_path == source else root_path.relative_to(source).as_posix()
+        stats.scanned_directories += 1
+        progress.render(stats, rel_root)
 
         pruned_dirnames: list[str] = []
         for dirname in sorted(dirnames):
@@ -324,20 +435,31 @@ def collect_files(
                 stats.pruned_directories += 1
                 continue
 
+            if matches_gitignore(rel_dir, gitignore_spec, is_dir=True):
+                stats.pruned_directories += 1
+                stats.skipped_gitignore += 1
+                continue
+
             pruned_dirnames.append(dirname)
 
         dirnames[:] = pruned_dirnames
 
         for filename in sorted(filenames):
+            stats.scanned_files += 1
             file_path = root_path / filename
             rel_path = f"{rel_root}/{filename}" if rel_root else filename
             rel_path = rel_path.replace(os.sep, "/")
+            progress.render(stats, rel_path)
 
             if output_path is not None and same_path(file_path, output_path):
                 continue
 
             if file_path.is_symlink() and not follow_symlinks:
                 stats.skipped_pattern += 1
+                continue
+
+            if matches_gitignore(rel_path, gitignore_spec):
+                stats.skipped_gitignore += 1
                 continue
 
             if should_skip_file(rel_path, filename, exclude_patterns, include_patterns):
@@ -378,6 +500,22 @@ def collect_files(
 
     collected.sort(key=lambda item: item.relative_path.lower())
     return collected, stats
+
+
+def matches_gitignore(path_str: str, gitignore_spec: Any | None, is_dir: bool = False) -> bool:
+    """Return True when a relative path is ignored by source/.gitignore."""
+    if gitignore_spec is None:
+        return False
+
+    normalized = path_str.replace("\\", "/").strip("/")
+    if not normalized:
+        return False
+
+    candidates = [normalized]
+    if is_dir:
+        candidates.insert(0, normalized + "/")
+
+    return any(gitignore_spec.match_file(candidate) for candidate in candidates)
 
 
 def should_prune_directory(rel_dir: str, dirname: str, exclude_patterns: Sequence[str]) -> bool:
@@ -595,10 +733,13 @@ def build_digest_text(
 
     lines = [
         f"Directory: {source}",
+        f"Scanned directories: {stats.scanned_directories}",
+        f"Scanned files: {stats.scanned_files}",
         f"Files analyzed: {stats.included_files}",
         f"Included bytes: {stats.included_bytes:,} ({human_size(stats.included_bytes)})",
         f"Max included file size: {human_size(max_file_bytes)}",
         f"Pruned directories: {stats.pruned_directories}",
+        f"Skipped by .gitignore: {stats.skipped_gitignore}",
         f"Skipped by pattern/default ignore: {stats.skipped_pattern}",
         f"Skipped as too large: {stats.skipped_too_large}",
         f"Skipped as binary: {stats.skipped_binary}",
